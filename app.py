@@ -64,17 +64,30 @@ def parse_with_gemini(raw_text: str):
         print(f"❌ Gemini parsing failed: {e}")
         return None
 
-def find_linkedin(name: str, company: str):
-    """Silent background search for the LinkedIn URL."""
-    if not company:
+def find_linkedin(name: str, company: str, role: str):
+    """Strict background search that ONLY accepts actual LinkedIn profile URLs."""
+    if not name or not company:
         return ""
-    query = f'{name} {company} site:linkedin.com/in/'
+        
+    # We use quotes around the name and company to force exact phrasing
+    query = f'"{name}" "{company}" {role} site:linkedin.com/in/'
+    print(f"🕵️‍♂️ Searching DDGS with exact query: {query}")
+    
     try:
-        results = list(DDGS().text(query, max_results=1))
-        if results:
-            return results[0].get("href", "")
-    except Exception:
-        pass
+        # Pull the top 3 results instead of 1, just in case the top result is an ad or garbage
+        results = list(DDGS().text(query, max_results=3))
+        
+        for result in results:
+            url = result.get("href", "")
+            
+            # THE BOUNCER: Ignore absolutely anything that isn't a true LinkedIn profile
+            if "linkedin.com/in/" in url:
+                print(f"✅ Verified LinkedIn: {url}")
+                return url
+                
+    except Exception as e:
+        print(f"⚠️ Web search error: {e}")
+        
     return ""
 
 def push_to_airtable(data: dict, linkedin_url: str):
@@ -166,7 +179,11 @@ def process_and_enrich(raw_text: str, chat_id: int):
             send_telegram_message(chat_id, "❌ I couldn't understand that note. Try rephrasing?")
             return
             
-        linkedin_url = find_linkedin(parsed_data.get("name"), parsed_data.get("company"))
+        linkedin_url = find_linkedin(
+            parsed_data.get("name", ""), 
+            parsed_data.get("company", ""),
+            parsed_data.get("role", "")
+        )
         success = push_to_airtable(parsed_data, linkedin_url)
         
         if success:
