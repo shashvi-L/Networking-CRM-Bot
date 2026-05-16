@@ -56,38 +56,47 @@ def parse_with_gemini(raw_text: str):
         return None
 
 def find_linkedin(name: str, company: str, role: str):
-    """Strict background search that ONLY accepts actual LinkedIn profile URLs."""
+    """Strict background search using standard requests to avoid async event loop crashes."""
     if not name or not company:
         return ""
         
     query = f'"{name}" "{company}" {role} site:linkedin.com/in/'
     print(f"🕵️‍♂️ Searching DDGS with exact query: {query}")
     
+    # We use DuckDuckGo's HTML-only endpoint which requires zero async event loops
+    url = "https://html.duckduckgo.com/html/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    payload = {"q": query}
+    
     try:
-        # Create a synchronous worker inner function
-        def run_search():
-            with DDGS() as ddgs:
-                return list(ddgs.text(query, max_results=3))
-                
-        # Force the synchronous DDGS call to run in an isolated thread pool 
-        # so it can never freeze Render's main event loop
-        loop = asyncio.get_event_loop()
-        results = loop.run_in_executor(None, run_search)
+        # Simple, stable, synchronous POST request with a 10-second timeout
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
         
-        # Give the search a strict 8-second timeout so it never hangs infinitely
-        import concurrent.futures
-        try:
-            results_list = results.result(timeout=8)
-        except concurrent.futures.TimeoutError:
-            print("⚠️ DDGS search timed out!")
-            return ""
-
-        for result in results_list:
-            url = result.get("href", "")
-            if "linkedin.com/in/" in url:
-                print(f"✅ Verified LinkedIn: {url}")
-                return url
-                
+        if response.status_code == 200:
+            html_text = response.text
+            
+            # Simple string parsing to look for raw LinkedIn URLs in the HTML response
+            import re
+            links = re.findall(r'href="([^"]+)"', html_text)
+            
+            for link in links:
+                # Clean up DuckDuckGo's internal redirect styling if present
+                if "linkedin.com/in/" in link:
+                    # Sometimes DDG wraps URLs like /l/?kh=-1&uddg=https://linkedin.com/in/abc
+                    if "uddg=" in link:
+                        link = link.split("uddg=")[1].split("&")[0]
+                        import urllib.parse
+                        link = urllib.parse.unquote(link)
+                        
+                    print(f"✅ Verified LinkedIn: {link}")
+                    return link
+                    
+            print("⚠️ No LinkedIn profile found in search results.")
+        else:
+            print(f"⚠️ Search engine returned status code: {response.status_code}")
+            
     except Exception as e:
         print(f"⚠️ Web search error: {e}")
         
