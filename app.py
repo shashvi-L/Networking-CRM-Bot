@@ -39,20 +39,40 @@ class ReplyContext:
 
 # --- CORE BRAIN (Unchanged, just uses ReplyContext now) ---
 def parse_with_gemini(raw_text: str):
+    """Uses Gemini's native JSON mode for 100% reliable parsing."""
+    print(f"🧠 Asking Gemini to parse: '{raw_text}'...")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={os.getenv('GEMINI_API_KEY')}"
+    
     prompt = f"""
     You are an AI networking CRM. Analyze this note: "{raw_text}"
     Extract: name, role, company, industry, date_met, location_met.
     Rewrite context_summary professionally. Extract follow-up action.
     Return ONLY a valid JSON object with these exact keys. Leave unknowns empty.
     """
+    
+    # The ultimate fix: Force Gemini to return pure JSON at the engine level
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    
     try:
-        response = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]})
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+        
+        # If Google throws an API error, print the exact reason to Render logs
+        if response.status_code != 200:
+            print(f"❌ Google API Error: {response.text}")
+            
         response.raise_for_status()
-        clean_json = response.json()['candidates'][0]['content']['parts'][0]['text'].replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
+        
+        # Because we used JSON mode, we don't need any regex or stripping.
+        raw_response_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+        return json.loads(raw_response_text)
+        
     except Exception as e:
-        print(f"❌ Gemini error: {e}")
+        print(f"❌ Gemini parsing error: {e}")
         return None
 
 def find_linkedin(name: str, company: str, role: str):
