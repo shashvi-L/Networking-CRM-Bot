@@ -1,222 +1,178 @@
 import os
 import json
 import requests
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Header, HTTPException
 from dotenv import load_dotenv
 from ddgs import DDGS
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
 
 load_dotenv()
 
-app = FastAPI(title="Networking-CRM-Bot")
+app = FastAPI(title="Universal Networking CRM")
 
-REQUIRED_ENV_VARS = [
-    "TELEGRAM_BOT_TOKEN", 
-    "GEMINI_API_KEY", 
-    "AIRTABLE_PAT", 
-    "AIRTABLE_BASE_ID"
-]
-
-missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
-if missing_vars:
-    raise RuntimeError(f"Missing required environment variables in .env: {', '.join(missing_vars)}")
-
+# Optional environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DISCORD_APP_ID = os.getenv("DISCORD_APP_ID")
+DISCORD_PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
 
-def send_telegram_message(chat_id: int, text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+# --- PLATFORM ROUTER ---
+class ReplyContext:
+    """Universal messaging router. Knows how to reply to both TG and Discord."""
+    def __init__(self, platform: str, target_id: str):
+        self.platform = platform
+        self.target_id = target_id # Chat ID for TG, Interaction Token for Discord
 
+    def send(self, text: str):
+        if self.platform == "telegram" and TELEGRAM_TOKEN:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": self.target_id, "text": text, "parse_mode": "HTML"})
+            
+        elif self.platform == "discord" and DISCORD_APP_ID:
+            # Discord requires a PATCH to update the deferred interaction response
+            url = f"https://discord.com/api/v10/webhooks/{DISCORD_APP_ID}/{self.target_id}/messages/@original"
+            
+            # Convert basic HTML bold/italics to Discord Markdown
+            formatted_text = text.replace("<b>", "**").replace("</b>", "**").replace("<i>", "*").replace("</i>", "*")
+            requests.patch(url, json={"content": formatted_text})
+
+# --- CORE BRAIN (Unchanged, just uses ReplyContext now) ---
 def parse_with_gemini(raw_text: str):
-    """Uses Gemini to extract full context, including Role, Company, Industry, and Date."""
-    print(f"🧠 Asking Gemini to parse: '{raw_text}'...")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={os.getenv('GEMINI_API_KEY')}"
-    
     prompt = f"""
-    You are an AI assistant for a networking CRM. Analyze this unstructured note: "{raw_text}"
-    
-    Perform these exact tasks:
-    1. Extract the person's first and last name.
-    2. Extract their specific job title or role.
-    3. Extract their company or organization name.
-    4. Infer the general 'Industry' based on their company or our conversation (e.g., 'Fintech', 'AI', 'Venture Capital').
-    5. Extract the date/time we met (e.g., 'Yesterday evening', 'Oct 12th', 'Tuesday'). If not mentioned, output 'Unspecified'.
-    6. Extract the location where we met.
-    7. Rewrite and polish the context of our interaction into a clear, professional summary.
-    8. Identify any follow-up task/action required. Leave empty if none.
-    
-    Return ONLY a valid JSON object with EXACTLY these keys: 
-    "name", "role", "company", "industry", "date_met", "location_met", "context_summary", "action".
-    Leave values as an empty string if completely unknown. No markdown backticks.
+    You are an AI networking CRM. Analyze this note: "{raw_text}"
+    Extract: name, role, company, industry, date_met, location_met.
+    Rewrite context_summary professionally. Extract follow-up action.
+    Return ONLY a valid JSON object with these exact keys. Leave unknowns empty.
     """
-    
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
-        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]})
         response.raise_for_status()
-        result_text = response.json()['candidates'][0]['content']['parts'][0]['text']
-        clean_json_string = result_text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json_string)
+        clean_json = response.json()['candidates'][0]['content']['parts'][0]['text'].replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_json)
     except Exception as e:
-        print(f"❌ Gemini parsing failed: {e}")
+        print(f"❌ Gemini error: {e}")
         return None
 
 def find_linkedin(name: str, company: str, role: str):
-    """Strict background search that ONLY accepts actual LinkedIn profile URLs."""
-    if not name or not company:
-        return ""
-        
-    # We use quotes around the name and company to force exact phrasing
+    if not name or not company: return ""
     query = f'"{name}" "{company}" {role} site:linkedin.com/in/'
-    print(f"🕵️‍♂️ Searching DDGS with exact query: {query}")
-    
     try:
-        # Pull the top 3 results instead of 1, just in case the top result is an ad or garbage
         results = list(DDGS().text(query, max_results=3))
-        
-        for result in results:
-            url = result.get("href", "")
-            
-            # THE BOUNCER: Ignore absolutely anything that isn't a true LinkedIn profile
-            if "linkedin.com/in/" in url:
-                print(f"✅ Verified LinkedIn: {url}")
-                return url
-                
-    except Exception as e:
-        print(f"⚠️ Web search error: {e}")
-        
+        for res in results:
+            if "linkedin.com/in/" in res.get("href", ""): return res.get("href")
+    except Exception: pass
     return ""
 
 def push_to_airtable(data: dict, linkedin_url: str):
-    """Pushes the comprehensively extracted record into Airtable."""
-    print(f"📝 Pushing {data.get('name')} to Airtable...")
-    base_id = os.getenv("AIRTABLE_BASE_ID")
-    url = f"https://api.airtable.com/v0/{base_id}/Contacts"
+    url = f"https://api.airtable.com/v0/{os.getenv('AIRTABLE_BASE_ID')}/Contacts"
+    headers = {"Authorization": f"Bearer {os.getenv('AIRTABLE_PAT')}", "Content-Type": "application/json"}
+    fields = {"Name": data.get("name", "Unknown")}
     
-    headers = {
-        "Authorization": f"Bearer {os.getenv('AIRTABLE_PAT')}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "fields": {
-            "Name": data.get("name", "Unknown"),
-            "Current Role": data.get("role", ""),
-            "Company": data.get("company", ""),
-            "Industry": data.get("industry", ""),
-            "Date Met": data.get("date_met", ""),
-            "Location Met": data.get("location_met", ""),
-            "Context Summary": data.get("context_summary", ""),
-            "Action": data.get("action", ""),
-            "LinkedIn": linkedin_url if "http" in linkedin_url else ""
-        }
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"❌ Failed pushing to Airtable: {e}")
-        return False
+    def add_val(key, val):
+        if val and str(val).strip() and str(val).strip() != "Unspecified": fields[key] = str(val).strip()
 
-def search_airtable(query: str, chat_id: int):
-    """GLOBAL SEARCH: Scans across Name, Company, Industry, Role, Location, and Notes."""
-    send_telegram_message(chat_id, f"🔍 Searching entire CRM for <b>{query}</b>...")
+    add_val("Current Role", data.get("role"))
+    add_val("Company", data.get("company"))
+    add_val("Industry", data.get("industry"))
+    add_val("Date Met", data.get("date_met"))
+    add_val("Location Met", data.get("location_met"))
+    add_val("Context Summary", data.get("context_summary"))
+    add_val("Action", data.get("action"))
+    if linkedin_url: fields["LinkedIn"] = linkedin_url
+
+    try:
+        requests.post(url, headers=headers, json={"fields": fields}).raise_for_status()
+        return True
+    except Exception: return False
+
+def process_and_enrich(raw_text: str, ctx: ReplyContext):
+    parsed = parse_with_gemini(raw_text)
+    if not parsed:
+        return ctx.send("❌ I couldn't understand that note. Try rephrasing?")
     
-    base_id = os.getenv("AIRTABLE_BASE_ID")
-    url = f"https://api.airtable.com/v0/{base_id}/Contacts"
+    linkedin_url = find_linkedin(parsed.get("name"), parsed.get("company"), parsed.get("role"))
+    if push_to_airtable(parsed, linkedin_url):
+        msg = f"✅ **Saved {parsed.get('name')} to CRM!**"
+        if parsed.get("action"): msg += f"\n🎯 **Action:** {parsed.get('action')}"
+        ctx.send(msg)
+    else:
+        ctx.send("❌ Failed to save to Airtable.")
+
+def search_airtable(query: str, ctx: ReplyContext):
+    url = f"https://api.airtable.com/v0/{os.getenv('AIRTABLE_BASE_ID')}/Contacts"
     headers = {"Authorization": f"Bearer {os.getenv('AIRTABLE_PAT')}"}
-    
-    # MAGIC FORMULA: Combines all major fields into one giant string, then searches it.
     formula = f"SEARCH(LOWER('{query}'), LOWER(CONCATENATE({{Name}}, ' ', {{Current Role}}, ' ', {{Company}}, ' ', {{Industry}}, ' ', {{Location Met}}, ' ', {{Context Summary}})))"
-    params = {"filterByFormula": formula}
     
     try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        records = response.json().get("records", [])
-        
-        if not records:
-            send_telegram_message(chat_id, f"🤷‍♂️ No results found anywhere in the CRM for '{query}'.")
-            return
+        records = requests.get(url, headers=headers, params={"filterByFormula": formula}).json().get("records", [])
+        if not records: return ctx.send(f"🤷‍♂️ No results found for '{query}'.")
 
         if len(records) == 1:
-            contact = records[0]["fields"]
-            reply = (
-                f"👤 <b>{contact.get('Name', 'Unknown')}</b> — <i>{contact.get('Current Role', 'Unknown Role')}</i>\n"
-                f"🏢 <b>{contact.get('Company', 'No Company')}</b> ({contact.get('Industry', 'Unknown Industry')})\n"
-                f"📍 Met at: {contact.get('Location Met', 'Unknown Location')} on {contact.get('Date Met', 'Unknown Date')}\n"
-                f"📅 <b>Action:</b> {contact.get('Action', 'None')}\n"
-                f"🔗 {contact.get('LinkedIn', 'No LinkedIn')}\n\n"
-                f"📝 <b>Notes:</b> {contact.get('Context Summary', 'No notes')}"
-            )
-            send_telegram_message(chat_id, reply)
+            c = records[0]["fields"]
+            ctx.send(f"👤 **{c.get('Name', 'Unknown')}** — *{c.get('Current Role', 'Unknown')}*\n🏢 **{c.get('Company', 'No Company')}**\n📅 **Action:** {c.get('Action', 'None')}\n🔗 {c.get('LinkedIn', 'No LinkedIn')}\n📝 **Notes:** {c.get('Context Summary', '')}")
         else:
-            reply = f"🎯 Found {len(records)} matches for '<b>{query}</b>':\n\n"
-            for record in records[:5]:
-                contact = record["fields"]
-                reply += f"🔹 <b>{contact.get('Name', 'Unknown')}</b> - {contact.get('Company', 'No Company')} ({contact.get('Industry', 'Industry')})\n"
-            
-            if len(records) > 5:
-                reply += f"\n<i>...and {len(records) - 5} more. Try typing a bit more to narrow it down!</i>"
-                
-            send_telegram_message(chat_id, reply)
+            reply = f"🎯 Found {len(records)} matches for '**{query}**':\n\n"
+            for r in records[:5]:
+                reply += f"🔹 **{r['fields'].get('Name', 'Unknown')}** - {r['fields'].get('Company', 'No Company')}\n"
+            ctx.send(reply)
+    except Exception: ctx.send("⚠️ Error connecting to Airtable.")
 
-    except Exception as e:
-        send_telegram_message(chat_id, "⚠️ Error connecting to Airtable search.")
-        print(f"Search error: {e}")
-
-def process_and_enrich(raw_text: str, chat_id: int):
-    try:
-        send_telegram_message(chat_id, "⏳ Parsing notes and extracting details...")
-        
-        parsed_data = parse_with_gemini(raw_text)
-        if not parsed_data:
-            send_telegram_message(chat_id, "❌ I couldn't understand that note. Try rephrasing?")
-            return
-            
-        linkedin_url = find_linkedin(
-            parsed_data.get("name", ""), 
-            parsed_data.get("company", ""),
-            parsed_data.get("role", "")
-        )
-        success = push_to_airtable(parsed_data, linkedin_url)
-        
-        if success:
-            success_msg = f"✅ <b>Saved {parsed_data.get('name')} from {parsed_data.get('company')}!</b>"
-            if parsed_data.get("action"):
-                success_msg += f"\n🎯 <b>Action:</b> {parsed_data.get('action')}"
-            send_telegram_message(chat_id, success_msg)
-        else:
-            send_telegram_message(chat_id, f"❌ Failed to save to Airtable.")
-            
-    except Exception as e:
-        send_telegram_message(chat_id, "❌ An unexpected error occurred in the pipeline.")
-        print(f"❌ Pipeline error: {e}")
-
+# --- TELEGRAM ENDPOINT ---
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
-    
     if "message" in payload and "text" in payload["message"]:
-        raw_text = payload["message"]["text"]
-        chat_id = payload["message"]["chat"]["id"]
+        text = payload["message"]["text"]
+        ctx = ReplyContext(platform="telegram", target_id=payload["message"]["chat"]["id"])
         
-        if raw_text.startswith("/find"):
-            query = raw_text.replace("/find", "").strip()
-            if query:
-                background_tasks.add_task(search_airtable, query, chat_id)
-            else:
-                background_tasks.add_task(send_telegram_message, chat_id, "Please include a keyword! Example: /find AI or /find Google")
+        if text.startswith("/find"):
+            background_tasks.add_task(search_airtable, text.replace("/find", "").strip(), ctx)
         else:
-            background_tasks.add_task(process_and_enrich, raw_text, chat_id)
-            
-        return {"status": "queued"}
-    return {"status": "ignored"}
+            ctx.send("⏳ Parsing notes...")
+            background_tasks.add_task(process_and_enrich, text, ctx)
+    return {"status": "queued"}
 
-@app.get("/health")
-def health(): return {"status": "healthy"}
+# --- DISCORD ENDPOINT ---
+@app.post("/discord-webhook")
+async def discord_webhook(
+    request: Request, 
+    background_tasks: BackgroundTasks,
+    x_signature_ed25519: str = Header(None),
+    x_signature_timestamp: str = Header(None)
+):
+    if not DISCORD_PUBLIC_KEY:
+        raise HTTPException(status_code=400, detail="Discord not configured")
+
+    # 1. Cryptographic Security Check
+    body = await request.body()
+    verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+    try:
+        verify_key.verify(f"{x_signature_timestamp}{body.decode('utf-8')}".encode(), bytes.fromhex(x_signature_ed25519))
+    except BadSignatureError:
+        raise HTTPException(status_code=401, detail="Invalid request signature")
+
+    payload = json.loads(body)
+    
+    # 2. Handle Discord Verification Ping
+    if payload.get("type") == 1:
+        return {"type": 1}
+
+    # 3. Handle Slash Commands
+    if payload.get("type") == 2:
+        command_name = payload["data"]["name"]
+        interaction_token = payload["token"]
+        
+        # Get the text the user typed
+        options = payload["data"].get("options", [])
+        user_input = options[0]["value"] if options else ""
+
+        ctx = ReplyContext(platform="discord", target_id=interaction_token)
+
+        if command_name == "save":
+            background_tasks.add_task(process_and_enrich, user_input, ctx)
+        elif command_name == "find":
+            background_tasks.add_task(search_airtable, user_input, ctx)
+
+        # Discord requires an immediate response < 3 seconds. Type 5 means "Bot is thinking..."
+        return {"type": 5}
