@@ -45,9 +45,19 @@ def parse_with_gemini(raw_text: str):
     
     prompt = f"""
     You are an AI networking CRM. Analyze this note: "{raw_text}"
-    Extract: name, role, company, industry, date_met, location_met.
-    Rewrite context_summary professionally. Extract follow-up action.
-    Return ONLY a valid JSON object with these exact keys. Leave unknowns empty.
+    
+    Return a JSON object using EXACTLY this structure and these exact keys:
+    {{
+        "name": "",
+        "role": "",
+        "company": "",
+        "industry": "",
+        "date_met": "",
+        "location_met": "",
+        "context_summary": "professionally rewritten summary",
+        "action": "extracted follow-up action, or empty string if none"
+    }}
+    Leave values as an empty string "" if the information is missing.
     """
     
     # The ultimate fix: Force Gemini to return pure JSON at the engine level
