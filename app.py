@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from ddgs import DDGS
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
+import asyncio
 
 load_dotenv()
 
@@ -55,13 +56,41 @@ def parse_with_gemini(raw_text: str):
         return None
 
 def find_linkedin(name: str, company: str, role: str):
-    if not name or not company: return ""
+    """Strict background search that ONLY accepts actual LinkedIn profile URLs."""
+    if not name or not company:
+        return ""
+        
     query = f'"{name}" "{company}" {role} site:linkedin.com/in/'
+    print(f"🕵️‍♂️ Searching DDGS with exact query: {query}")
+    
     try:
-        results = list(DDGS().text(query, max_results=3))
-        for res in results:
-            if "linkedin.com/in/" in res.get("href", ""): return res.get("href")
-    except Exception: pass
+        # Create a synchronous worker inner function
+        def run_search():
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=3))
+                
+        # Force the synchronous DDGS call to run in an isolated thread pool 
+        # so it can never freeze Render's main event loop
+        loop = asyncio.get_event_loop()
+        results = loop.run_in_executor(None, run_search)
+        
+        # Give the search a strict 8-second timeout so it never hangs infinitely
+        import concurrent.futures
+        try:
+            results_list = results.result(timeout=8)
+        except concurrent.futures.TimeoutError:
+            print("⚠️ DDGS search timed out!")
+            return ""
+
+        for result in results_list:
+            url = result.get("href", "")
+            if "linkedin.com/in/" in url:
+                print(f"✅ Verified LinkedIn: {url}")
+                return url
+                
+    except Exception as e:
+        print(f"⚠️ Web search error: {e}")
+        
     return ""
 
 def push_to_airtable(data: dict, linkedin_url: str):
