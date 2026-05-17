@@ -69,15 +69,18 @@ def parse_with_gemini(raw_text: str):
     }
     
     try:
+        try:
         response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
         
-        # If Google throws an API error, print the exact reason to Render logs
+        # Explicitly catch Gemini rate limits
+        if response.status_code == 429:
+            print("⚠️ Gemini Rate Limit Hit!")
+            return "RATE_LIMIT"
+            
         if response.status_code != 200:
             print(f"❌ Google API Error: {response.text}")
             
         response.raise_for_status()
-        
-        # Because we used JSON mode, we don't need any regex or stripping.
         raw_response_text = response.json()['candidates'][0]['content']['parts'][0]['text']
         return json.loads(raw_response_text)
         
@@ -156,6 +159,10 @@ def push_to_airtable(data: dict, linkedin_url: str):
 
 def process_and_enrich(raw_text: str, ctx: ReplyContext):
     parsed = parse_with_gemini(raw_text)
+
+    if parsed == "RATE_LIMIT":
+        return ctx.send("⏳ **Whoa, slow down!** Google's AI hit its free-tier speed limit. Please wait 60 seconds and try again.")
+        
     if not parsed:
         return ctx.send("❌ I couldn't understand that note. Try rephrasing?")
     
