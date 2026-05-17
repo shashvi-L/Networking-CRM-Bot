@@ -38,11 +38,9 @@ class ReplyContext:
             requests.patch(url, json={"content": formatted_text})
 
 # --- CORE BRAIN (Unchanged, just uses ReplyContext now) ---
+# --- 1. PRIMARY BRAIN: GEMINI ---
 def parse_with_gemini(raw_text: str):
-    """Uses Gemini's native JSON mode for 100% reliable parsing."""
-    print(f"🧠 Asking Gemini to parse: '{raw_text}'...")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={os.getenv('GEMINI_API_KEY')}"
-    
     prompt = f"""
     You are an AI networking CRM. Analyze this note: "{raw_text}"
     
@@ -57,35 +55,67 @@ def parse_with_gemini(raw_text: str):
         "context_summary": "professionally rewritten summary",
         "action": "extracted follow-up action, or empty string if none"
     }}
-    Leave values as an empty string "" if the information is missing.
+    Leave values as empty strings "" if missing.
     """
-    
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json"
-        }
+        "generationConfig": {"responseMimeType": "application/json"}
     }
     
     try:
         response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
-        
-        # Explicitly catch Gemini rate limits
         if response.status_code == 429:
-            print("⚠️ Gemini Rate Limit Hit!")
             return "RATE_LIMIT"
-            
-        if response.status_code != 200:
-            print(f"❌ Google API Error: {response.text}")
-            
         response.raise_for_status()
-        
-        raw_response_text = response.json()['candidates'][0]['content']['parts'][0]['text']
-        return json.loads(raw_response_text)
-        
+        return json.loads(response.json()['candidates'][0]['content']['parts'][0]['text'])
     except Exception as e:
-        print(f"❌ Gemini parsing error: {e}")
+        print(f"❌ Gemini error: {e}")
         return None
+
+# --- 2. FALLBACK BRAIN: OPENAI ---
+def parse_with_openai(raw_text: str):
+    prompt = """
+    You are an AI networking CRM. Analyze the user's note.
+    
+    Return a JSON object using EXACTLY this structure and these exact keys:
+    {
+        "name": "",
+        "role": "",
+        "company": "",
+        "industry": "",
+        "date_met": "",
+        "location_met": "",
+        "context_summary": "professionally rewritten summary",
+        "action": "extracted follow-up action, or empty string if none"
+    }
+    Leave values as empty strings "" if missing.
+    """
+    try:
+        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={ "type": "json_object" },
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": raw_text}
+            ]
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"❌ OpenAI error: {e}")
+        return None
+
+# --- 3. THE FAILOVER ROUTER ---
+def parse_note_with_fallback(raw_text: str):
+    """Attempts Gemini first, seamlessly switches to OpenAI if it fails."""
+    print("🔄 Routing to Gemini (Primary)...")
+    result = parse_with_gemini(raw_text)
+    
+    if result == "RATE_LIMIT" or result is None:
+        print("⚠️ Gemini unavailable or rate-limited. Falling back to OpenAI...")
+        result = parse_with_openai(raw_text)
+        
+    return result
 
 def find_linkedin(name: str, company: str, role: str):
     """Strict background search using standard requests to avoid async event loop crashes."""
@@ -157,10 +187,10 @@ def push_to_airtable(data: dict, linkedin_url: str):
     except Exception: return False
 
 def process_and_enrich(raw_text: str, ctx: ReplyContext):
-    parsed = parse_with_gemini(raw_text)
-
-    if parsed == "RATE_LIMIT":
-        return ctx.send("⏳ **Whoa, slow down!** Google's AI hit its free-tier speed limit. Please wait 60 seconds and try again.")
+    parsed = parse_note_with_fallback(raw_text)
+    
+    if not parsed:
+        return ctx.send("❌ Both AI engines failed to understand that note. Try rephrasing?")
         
     if not parsed:
         return ctx.send("❌ I couldn't understand that note. Try rephrasing?")
