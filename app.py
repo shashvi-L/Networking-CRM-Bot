@@ -60,7 +60,6 @@ def parse_with_gemini(raw_text: str):
     Leave values as an empty string "" if the information is missing.
     """
     
-    # The ultimate fix: Force Gemini to return pure JSON at the engine level
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -69,7 +68,6 @@ def parse_with_gemini(raw_text: str):
     }
     
     try:
-        try:
         response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
         
         # Explicitly catch Gemini rate limits
@@ -81,6 +79,7 @@ def parse_with_gemini(raw_text: str):
             print(f"❌ Google API Error: {response.text}")
             
         response.raise_for_status()
+        
         raw_response_text = response.json()['candidates'][0]['content']['parts'][0]['text']
         return json.loads(raw_response_text)
         
